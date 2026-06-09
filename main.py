@@ -14,6 +14,7 @@ from datetime import datetime
 import config
 import settings_store
 import tracer as tracer_module
+import bms as bms_module
 import webui
 import wifi_manager
 
@@ -81,9 +82,14 @@ def control_loop(tracer) -> dict:
             else:
                 logger.error("stop_charging failed (Modbus write error)")
         elif temp <= cfg["temp_low"] and data.get("charge_stopped"):
-            tracer.resume_charging(cfg["boost_voltage_normal_v"])
-            data["charge_stopped"] = False
+            # BMS cell OV中は温度ベースの再開を行わない
+            if not bms_module.is_ov_active():
+                tracer.resume_charging(cfg["boost_voltage_normal_v"])
+                data["charge_stopped"] = False
+            else:
+                logger.info("resume_charging skipped: BMS cell OV still active")
 
+    data["bms"] = bms_module.get_status()
     webui.set_status(data)
     return data
 
@@ -93,10 +99,25 @@ def control_loop(tracer) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    logger.info("=== CarIoT starting (Phase ①) ===")
+    logger.info("=== CarIoT starting (Phase ②) ===")
 
     settings_store.load()
     tracer = tracer_module.create_tracer()
+
+    # BMS cell OV → Tracer充電停止コールバック
+    def on_bms_ov(bms_name: str, reason: str):
+        logger.warning("BMS OV alert [%s]: %s → stopping Tracer charging", bms_name, reason)
+        ok = tracer.stop_charging()
+        if ok:
+            logger.warning("Tracer charging stopped by BMS OV protection [%s]", bms_name)
+        else:
+            logger.error("Tracer stop_charging FAILED after BMS OV alert [%s]!", bms_name)
+
+    bms_module.set_alert_callback(on_bms_ov)
+
+    # BMS 常時監視スレッド
+    bms_module.start_polling(_shutdown)
+    logger.info("BMS persistent monitoring started")
 
     # Flask を daemon thread で起動
     # WiFi監視スレッド

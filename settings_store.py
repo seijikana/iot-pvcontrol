@@ -22,6 +22,8 @@ def _defaults() -> dict:
         "temp_low":              config.TEMP_LOW,
         "boost_voltage_normal_v": round(config.BOOST_VOLTAGE_NORMAL * 0.01, 2),
         "boost_voltage_stop_v":   round(config.BOOST_VOLTAGE_STOP   * 0.01, 2),
+        "bms_ov_stop_v":          3.65,   # LiFePO4セル過電圧停止閾値[V]
+        "bms_ov_resume_v":        3.60,   # LiFePO4セル過電圧復帰閾値[V]（ヒステリシス）
     }
 
 
@@ -58,6 +60,8 @@ def update(patch: dict):
         tl = float(patch["temp_low"])
         vn = float(patch["boost_voltage_normal_v"])
         vs = float(patch["boost_voltage_stop_v"])
+        ov_stop   = float(patch["bms_ov_stop_v"])
+        ov_resume = float(patch["bms_ov_resume_v"])
     except (KeyError, ValueError, TypeError) as e:
         return False, f"パラメータエラー: {e}"
 
@@ -71,11 +75,17 @@ def update(patch: dict):
         return False, "電圧は 10〜15.5V の範囲で設定してください"
     if vs >= vn:
         return False, f"充電停止電圧({vs}V) は通常充電電圧({vn}V) より低くしてください"
+    if not (3.40 <= ov_resume < ov_stop <= 3.80):
+        return False, f"BMS過電圧閾値: 復帰({ov_resume}V) < 停止({ov_stop}V)、範囲 3.40〜3.80V"
+    if ov_stop - ov_resume < 0.03:
+        return False, f"ヒステリシス不足: 停止({ov_stop}) − 復帰({ov_resume}) は 0.03V 以上必要です"
 
     new = {
         "temp_high": th, "temp_low": tl,
         "boost_voltage_normal_v": round(vn, 2),
         "boost_voltage_stop_v":   round(vs, 2),
+        "bms_ov_stop_v":   round(ov_stop,   3),
+        "bms_ov_resume_v": round(ov_resume, 3),
     }
     with _lock:
         _state.update(new)

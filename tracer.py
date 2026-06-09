@@ -7,6 +7,7 @@ import os
 import math
 import time
 import logging
+import threading
 
 import config
 
@@ -87,6 +88,7 @@ class TracerModbus:
         if not self._c.connect():
             raise ConnectionError(f"Cannot connect to {config.TRACER_PORT}")
 
+        self._lock = threading.RLock()
         self._stopped = False
         # 起動時に全パラメータブロックを保存（復元用）
         r = self._c.read_holding_registers(0x9000, count=15, device_id=config.TRACER_SLAVE_ID)
@@ -117,6 +119,10 @@ class TracerModbus:
         return r.registers
 
     def read_all(self) -> dict:
+        with self._lock:
+            return self._read_all_locked()
+
+    def _read_all_locked(self) -> dict:
         # PV電圧/電流/電力 + バッテリー電圧/電流/電力 (0x3100-0x3107)
         r1 = self._ri(0x3100, 8)
         # 負荷電圧/電流/電力 + バッテリー温度 (0x310C-0x3110)
@@ -170,7 +176,12 @@ class TracerModbus:
         階層制約: OVReconnect <= ChargingLimit >= Equalize >= Boost >= Float >= BoostReconnect >= LowVoltReconnect
         注意: Tracerは現在の充電サイクルを継続するため即時停止ではない。
               次のサイクル（バッテリーがBoostReconnect以下に下がった後）から新目標が適用される。
+        BMS threadから呼ばれる場合があるためRLockで保護している。
         """
+        with self._lock:
+            return self._stop_charging_locked()
+
+    def _stop_charging_locked(self) -> bool:
         if self._stopped:
             return True
         low_vr = self._orig_params[self._IDX_LOW_V_RECONNECT]  # 0x900A 変更しない
@@ -205,6 +216,10 @@ class TracerModbus:
 
     def resume_charging(self, normal_v: float = None) -> bool:
         """元のパラメータブロックを復元して充電を再開。戻り値: 成否。"""
+        with self._lock:
+            return self._resume_charging_locked()
+
+    def _resume_charging_locked(self) -> bool:
         if not self._stopped:
             return True
         # force_user=False: orig_params[0]の元のbatttypeをそのまま復元する
@@ -213,20 +228,21 @@ class TracerModbus:
             # Boost充電タイマーを元の値に戻す
             self._c.write_registers(self._REG_BOOST_DURATION, [self._orig_boost_duration],
                                     device_id=config.TRACER_SLAVE_ID)
-            logger.info("Charging RESUMED boost→%.2fV (bat_temp < %.1f°C)",
-                        self._orig_params[self._IDX_BOOST] * 0.01, config.TEMP_LOW)
+            logger.info("Charging RESUMED boost→%.2fV",
+                        self._orig_params[self._IDX_BOOST] * 0.01)
             return True
         logger.error("resume_charging failed (Modbus write error)")
         return False
 
     def close(self):
-        if self._stopped:
-            self.resume_charging()
-        else:
-            self._c.write_registers(0x9000, self._orig_params, device_id=config.TRACER_SLAVE_ID)
-            self._c.write_registers(self._REG_BOOST_DURATION, [self._orig_boost_duration],
-                                    device_id=config.TRACER_SLAVE_ID)
-        self._c.close()
+        with self._lock:
+            if self._stopped:
+                self._resume_charging_locked()
+            else:
+                self._c.write_registers(0x9000, self._orig_params, device_id=config.TRACER_SLAVE_ID)
+                self._c.write_registers(self._REG_BOOST_DURATION, [self._orig_boost_duration],
+                                        device_id=config.TRACER_SLAVE_ID)
+            self._c.close()
 
 
 def create_tracer():

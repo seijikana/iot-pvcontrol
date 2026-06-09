@@ -1,4 +1,4 @@
-"""Flask WebUI - CarIoT ダッシュボード
+﻿"""Flask WebUI - CarIoT ダッシュボード
 
 エンドポイント:
   GET /              ダッシュボードHTML（認証不要）
@@ -118,10 +118,57 @@ footer{color:var(--dm);font-size:.72rem;text-align:center;
     </div>
   </div>
 </div>
+<div class="g2" id="bms-wrap" style="margin-bottom:10px;display:none">
+  <div class="card">
+    <div class="ct">&#128267; BMS1</div>
+    <div id="bms1-body"></div>
+  </div>
+  <div class="card">
+    <div class="ct">&#128267; BMS2</div>
+    <div id="bms2-body"></div>
+  </div>
+</div>
 <footer id="ts">取得中...</footer>
 <script>
 const $=id=>document.getElementById(id);
-const f=(v,d,u)=>v!=null?v.toFixed(d)+' '+u:'--';
+const f=(v,d,u)=>v!=null?v.toFixed(d)+' '+u:'--';
+function renderBMS(el,b){
+  if(!b){el.innerHTML='<div class="row"><span class="lbl r">未取得</span></div>';return;}
+  const on=b.online;
+  const hasData=b.cells&&b.cells.length>0;
+  const stale=!on&&hasData;
+  const dot='<span class="'+(on?'g':'r')+'">&#9679;</span> ';
+  let status=on?'ONLINE':'OFFLINE';
+  if(!on&&b.last_seen){
+    const mins=Math.round((Date.now()-new Date(b.last_seen).getTime())/60000);
+    status+=' <span style="font-size:.72rem;color:var(--dm)">('+mins+'分前)</span>';
+  }else if(!on&&!hasData){
+    status+=' <span style="font-size:.72rem;color:var(--dm)">(取得中...)</span>';
+  }
+  const fade=stale?'opacity:0.6;':'';
+  const pv=b.pack_v!=null?b.pack_v.toFixed(2)+' V':'--';
+  const pa=b.pack_a!=null?(b.pack_a>=0?'+':'')+b.pack_a.toFixed(2)+' A':'--';
+  const pw=b.pack_w!=null?(b.pack_w>=0?'+':'')+b.pack_w.toFixed(1)+' W':'--';
+  const soc=b.soc!=null?b.soc+' %':'--';
+  const ah=(b.remain_ah!=null&&b.full_ah!=null)
+    ?b.remain_ah.toFixed(1)+' / '+b.full_ah.toFixed(1)+' Ah':'--';
+  const tmp=b.temps&&b.temps.length?b.temps[0].toFixed(1)+' °C':'--';
+  const delta=b.cell_delta!=null?(b.cell_delta*1000).toFixed(0)+' mV':'--';
+  const dcls=b.cell_delta>0.05?'r':b.cell_delta>0.02?'y':'g';
+  const cells=(b.cells||[]).map((v,i)=>{
+    const c=v<3.0?'r':v<3.2?'y':'g';
+    return '<div class="row" style="'+fade+'"><span class="lbl">C'+(i+1)+'</span><span class="val '+c+'">'+v.toFixed(3)+' V</span></div>';
+  }).join('');
+  el.innerHTML=dot+status
+    +'<div class="row" style="'+fade+'"><span class="lbl">電圧</span><span class="val">'+pv+'</span></div>'
+    +'<div class="row"><span class="lbl">SOC</span><span class="val">'+soc+'</span></div>'
+    +'<div class="row" style="'+fade+'"><span class="lbl">残容量</span><span class="val">'+ah+'</span></div>'
+    +'<div class="row"><span class="lbl">電流</span><span class="val">'+pa+'</span></div>'
+    +'<div class="row"><span class="lbl">電力</span><span class="val">'+pw+'</span></div>'
+    +'<div class="row"><span class="lbl">温度</span><span class="val">'+tmp+'</span></div>'
+    +cells
+    +'<div class="row" style="'+fade+'"><span class="lbl">バランス差</span><span class="val '+dcls+'">'+delta+'</span></div>';
+}
 async function refresh(){
   try{
     const d=await fetch('/api/status').then(r=>r.json());
@@ -139,10 +186,10 @@ async function refresh(){
     $('chg').textContent=d.charge_status||'';
     const t=d.bat_temp;
     const te=$('bt-t');
-    te.textContent=t!=null?t.toFixed(1)+' °C':'--';
+    te.textContent=t!=null?t.toFixed(1)+' °C':'--';
     te.className='val '+(t>45?'r':t>40?'y':'g');
     const s=d.bat_soc;
-    $('bt-s').textContent=s!=null?s+' %':'--';
+    $('bt-s').textContent=s!=null?s+' %':'--';
     const bar=$('soc-f');
     bar.style.width=(s||0)+'%';
     bar.style.background=s>50?'#3fb950':s>20?'#d29922':'#f85149';
@@ -154,6 +201,11 @@ async function refresh(){
       al.className='alert alert-y';al.style.display='block';
       al.textContent='⚠ バッテリー温度警告: '+t.toFixed(1)+' °C';
     }else{al.style.display='none';}
+    if(d.bms&&Object.keys(d.bms).length){
+      $('bms-wrap').style.display='grid';
+      renderBMS($('bms1-body'),d.bms.bms1||null);
+      renderBMS($('bms2-body'),d.bms.bms2||null);
+    }
     const age=d.updated_at?Math.round((Date.now()-new Date(d.updated_at).getTime())/1000):null;
     $('ts').textContent='最終更新: '+new Date().toLocaleTimeString('ja-JP')+(age!=null?' ('+age+'秒前)':'');
   }catch(e){$('ts').textContent='通信エラー '+new Date().toLocaleTimeString('ja-JP');}
@@ -311,6 +363,27 @@ nav a{color:var(--bl);text-decoration:none;font-size:.85rem;margin-left:12px}
   </div>
 </div>
 
+<div class="card">
+  <h2>&#128267; BMS セル過電圧保護</h2>
+  <div class="field">
+    <label>過電圧検出閾値（停止）</label>
+    <div class="ir">
+      <input type="number" id="bms_ov_stop" step="0.01" min="3.50" max="3.80">
+      <span class="unit">V/cell</span>
+    </div>
+    <div class="hint">この値以上でTracerの充電を停止します（LiFePO4推奨: 3.65V）</div>
+  </div>
+  <div class="field">
+    <label>過電圧復帰閾値</label>
+    <div class="ir">
+      <input type="number" id="bms_ov_resume" step="0.01" min="3.40" max="3.79">
+      <span class="unit">V/cell</span>
+    </div>
+    <div class="hint">この値を下回ると充電を再開します（ヒステリシス: 推奨 0.05V以上）</div>
+  </div>
+  <div class="calc" id="ov_hyst">ヒステリシス: 読み込み中...</div>
+</div>
+
 <div id="msg"></div>
 <button class="btn" id="save">保存する</button>
 
@@ -325,8 +398,19 @@ function upd(){
     el.style.color=h>=2?'var(--g)':'var(--r)';
   }
 }
+function updOv(){
+  const st=parseFloat($('bms_ov_stop').value),re=parseFloat($('bms_ov_resume').value);
+  const el=$('ov_hyst');
+  if(!isNaN(st)&&!isNaN(re)){
+    const h=(st-re).toFixed(3);
+    el.textContent='ヒステリシス: '+h+'V　（復帰: '+re+'V ←→ 停止: '+st+'V）';
+    el.style.color=parseFloat(h)>=0.03?'var(--g)':'var(--r)';
+  }
+}
 $('temp_high').addEventListener('input',upd);
 $('temp_low').addEventListener('input',upd);
+$('bms_ov_stop').addEventListener('input',updOv);
+$('bms_ov_resume').addEventListener('input',updOv);
 
 async function load(){
   try{
@@ -335,7 +419,9 @@ async function load(){
     $('temp_low').value=d.temp_low;
     $('boost_normal').value=d.boost_voltage_normal_v;
     $('boost_stop').value=d.boost_voltage_stop_v;
-    upd();
+    $('bms_ov_stop').value=d.bms_ov_stop_v;
+    $('bms_ov_resume').value=d.bms_ov_resume_v;
+    upd();updOv();
   }catch(e){$('hyst').textContent='読み込みエラー: '+e.message;}
 }
 
@@ -345,6 +431,8 @@ $('save').addEventListener('click',async()=>{
     temp_low:parseFloat($('temp_low').value),
     boost_voltage_normal_v:parseFloat($('boost_normal').value),
     boost_voltage_stop_v:parseFloat($('boost_stop').value),
+    bms_ov_stop_v:parseFloat($('bms_ov_stop').value),
+    bms_ov_resume_v:parseFloat($('bms_ov_resume').value),
   };
   const msg=$('msg');
   msg.style.display='block';
