@@ -108,13 +108,17 @@ class TracerModbus:
                     self._orig_params[self._IDX_BATT_TYPE],
                     self._orig_boost_duration)
 
-        # 起動時に設定済みFloat電圧を即時適用
+        # 起動時に設定済み Boost / Float 電圧を即時適用
         init_params = self._normal_params()
-        if init_params[self._IDX_FLOAT] != self._orig_params[self._IDX_FLOAT]:
+        boost_changed = init_params[self._IDX_BOOST] != self._orig_params[self._IDX_BOOST]
+        float_changed = init_params[self._IDX_FLOAT] != self._orig_params[self._IDX_FLOAT]
+        if boost_changed or float_changed:
             self._write_params(init_params, force_user=False)
-            logger.info("Float voltage applied on startup: %.2fV (EEPROM was %.2fV)",
-                        init_params[self._IDX_FLOAT] * 0.01,
-                        self._orig_params[self._IDX_FLOAT] * 0.01)
+            logger.info(
+                "Voltage applied on startup: boost %.2fV→%.2fV  float %.2fV→%.2fV",
+                self._orig_params[self._IDX_BOOST] * 0.01, init_params[self._IDX_BOOST] * 0.01,
+                self._orig_params[self._IDX_FLOAT] * 0.01, init_params[self._IDX_FLOAT] * 0.01,
+            )
 
     @staticmethod
     def _s16(v: int) -> int:
@@ -169,13 +173,27 @@ class TracerModbus:
         }
 
     def _normal_params(self) -> list:
-        """通常充電時のパラメータ: orig_params のFloat電圧を設定値で上書きして返す。"""
+        """通常充電時のパラメータ: Boost / Float を settings 値で上書きして返す。
+
+        階層制約: ChargingLimit >= Equalize >= Boost >= Float >= BoostReconnect >= LowVoltReconnect
+        Boost を変更した場合は Equalize / ChargingLimit も必要に応じて引き上げる。
+        """
         cfg = settings_store.get()
-        fv = round(cfg.get("float_voltage_v", config.FLOAT_VOLTAGE_NORMAL * 0.01) * 100)
+        bv = round(cfg.get("boost_voltage_normal_v", config.BOOST_VOLTAGE_NORMAL * 0.01) * 100)
+        fv = round(cfg.get("float_voltage_v",        config.FLOAT_VOLTAGE_NORMAL  * 0.01) * 100)
         vals = list(self._orig_params)
-        # 階層制約: BoostReconnect <= Float <= Boost
-        fv = max(vals[self._IDX_BOOST_RECONNECT], min(vals[self._IDX_BOOST], fv))
+
+        vals[self._IDX_BOOST] = bv
+        # Float: BoostReconnect <= Float <= Boost
+        fv = max(vals[self._IDX_BOOST_RECONNECT], min(bv, fv))
         vals[self._IDX_FLOAT] = fv
+        # Equalize / ChargingLimit / OVReconnect の階層を維持
+        if vals[self._IDX_EQUALIZE] < bv:
+            vals[self._IDX_EQUALIZE] = bv
+        if vals[self._IDX_CHARGING_LIMIT] < vals[self._IDX_EQUALIZE]:
+            vals[self._IDX_CHARGING_LIMIT] = vals[self._IDX_EQUALIZE]
+        if vals[self._IDX_OV_RECONNECT] > vals[self._IDX_CHARGING_LIMIT]:
+            vals[self._IDX_OV_RECONNECT] = vals[self._IDX_CHARGING_LIMIT]
         return vals
 
     def _write_params(self, params: list, force_user: bool = True) -> bool:
@@ -203,13 +221,17 @@ class TracerModbus:
     def _stop_charging_locked(self) -> bool:
         if self._stopped:
             return True
+        cfg = settings_store.get()
+        stop_v = round(cfg.get("boost_voltage_stop_v", config.BOOST_VOLTAGE_STOP * 0.01) * 100)
         low_vr = self._orig_params[self._IDX_LOW_V_RECONNECT]  # 0x900A 変更しない
-        br = low_vr + 10              # BoostReconnect > LowVoltReconnect (厳密な大小関係が必要)
-        fl = br + 10                  # Float      = BoostReconnect + 0.10V
-        bv = fl + 10                  # Boost      = Float      + 0.10V
-        eq = bv + 10                  # Equalize   = Boost      + 0.10V
-        cl = eq + 10                  # ChargingLimit = Equalize + 0.10V
-        ovr = cl                      # OVReconnect = ChargingLimit (制約: OVReconnect <= ChargingLimit)
+
+        # 階層制約を満たしながら stop_v を Boost とする停止パラメータを構築
+        br  = max(low_vr, stop_v - 20)   # BoostReconnect >= LowVoltReconnect
+        fl  = max(br,     stop_v - 10)   # Float >= BoostReconnect
+        bv  = max(fl,     stop_v)        # Boost >= Float
+        eq  = bv + 10                    # Equalize >= Boost
+        cl  = eq + 10                    # ChargingLimit >= Equalize
+        ovr = cl                         # OVReconnect <= ChargingLimit (制約: = にしておく)
 
         vals = list(self._orig_params)
         vals[self._IDX_CHARGING_LIMIT]  = cl
@@ -228,8 +250,8 @@ class TracerModbus:
             actual_bv = rb.registers[0] * 0.01 if not rb.isError() else -1
             actual_fl = rb.registers[1] * 0.01 if not rb.isError() else -1
             logger.warning(
-                "Charging STOPPED: boost→%.2fV float→%.2fV (readback: boost=%.2fV float=%.2fV)",
-                bv * 0.01, fl * 0.01, actual_bv, actual_fl)
+                "Charging STOPPED: boost→%.2fV float→%.2fV br→%.2fV (readback: boost=%.2fV float=%.2fV)",
+                bv * 0.01, fl * 0.01, br * 0.01, actual_bv, actual_fl)
             return True
         return False
 
