@@ -100,7 +100,10 @@ WEBUI_PASSWORD = "changeme"   # 要変更
 # データ更新間隔
 POLLING_INTERVAL_SEC = 30    # ダッシュボード自動更新間隔（秒）
 TRACER_POLL_SEC      = 10    # Tracerデータ収集間隔（秒）- Modbus読み取りのみ、EEPROM無影響
-DATA_COLLECT_SEC     = 60    # CSVログ記録間隔（秒）
+DATA_COLLECT_SEC     = 60    # SQLiteログ記録間隔（秒）
+
+# 電力履歴 SQLite DB（SDカード上）
+HISTORY_DB_PATH = "/home/pi/cariot/history.db"
 
 # ============================================================
 # WiFi APモード設定（接続先不在時のフォールバック）

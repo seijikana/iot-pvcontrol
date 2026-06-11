@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""CarIoT メインループ (Phase ①: Tracer監視 + Flask WebUI)
+"""CarIoT メインループ (Phase ②: Tracer監視 + BMS + Flask WebUI)
 
 systemd から起動する。SIGTERM/SIGINT で graceful shutdown。
 """
-import csv
 import logging
 import os
 import signal
@@ -12,6 +11,7 @@ import time
 from datetime import datetime
 
 import config
+import history_store
 import settings_store
 import tracer as tracer_module
 import bms as bms_module
@@ -38,34 +38,6 @@ signal.signal(signal.SIGINT, _handle_signal)
 
 
 # ---------------------------------------------------------------------------
-# CSV ログ
-# ---------------------------------------------------------------------------
-
-_CSV_FIELDS = [
-    "timestamp", "pv_voltage", "pv_current", "pv_power",
-    "bat_voltage", "bat_current", "bat_power", "bat_temp", "bat_soc",
-    "load_voltage", "load_current", "load_power",
-    "charge_status", "charge_stopped", "mock",
-]
-
-
-def write_csv(data: dict):
-    os.makedirs(config.TRACER_LOG_DIR, exist_ok=True)
-    fname = os.path.join(
-        config.TRACER_LOG_DIR,
-        "tracer_" + datetime.now().strftime("%Y%m%d") + ".csv",
-    )
-    is_new = not os.path.exists(fname)
-    row = {k: data.get(k, "") for k in _CSV_FIELDS}
-    row["timestamp"] = datetime.now().isoformat(timespec="seconds")
-    with open(fname, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
-        if is_new:
-            w.writeheader()
-        w.writerow(row)
-
-
-# ---------------------------------------------------------------------------
 # 制御ループ（温度ヒステリシス）
 # ---------------------------------------------------------------------------
 
@@ -82,7 +54,6 @@ def control_loop(tracer) -> dict:
             else:
                 logger.error("stop_charging failed (Modbus write error)")
         elif temp <= cfg["temp_low"] and data.get("charge_stopped"):
-            # BMS cell OV中は温度ベースの再開を行わない
             if not bms_module.is_ov_active():
                 tracer.resume_charging(cfg["boost_voltage_normal_v"])
                 data["charge_stopped"] = False
@@ -102,9 +73,10 @@ def main():
     logger.info("=== CarIoT starting (Phase ②) ===")
 
     settings_store.load()
+    history_store.init_db()
+
     tracer = tracer_module.create_tracer()
 
-    # BMS cell OV → Tracer充電停止コールバック
     def on_bms_ov(bms_name: str, reason: str):
         logger.warning("BMS OV alert [%s]: %s → stopping Tracer charging", bms_name, reason)
         ok = tracer.stop_charging()
@@ -114,13 +86,9 @@ def main():
             logger.error("Tracer stop_charging FAILED after BMS OV alert [%s]!", bms_name)
 
     bms_module.set_alert_callback(on_bms_ov)
-
-    # BMS 常時監視スレッド
     bms_module.start_polling(_shutdown)
     logger.info("BMS persistent monitoring started")
 
-    # Flask を daemon thread で起動
-    # WiFi監視スレッド
     wifi_thread = threading.Thread(
         target=wifi_manager.monitor_loop,
         args=(_shutdown,),
@@ -144,7 +112,12 @@ def main():
     flask_thread.start()
     logger.info("Flask WebUI → http://%s:%d", config.WEBUI_HOST, config.WEBUI_PORT)
 
-    # 初回読み取り（ダッシュボードが空白にならないように）
+    # 起動時に過去7日分の欠損ロールアップを補完
+    try:
+        history_store.backfill_rollups()
+    except Exception as e:
+        logger.error("backfill_rollups error: %s", e)
+
     try:
         data = control_loop(tracer)
         logger.info("Initial read OK: PV=%.1fW Bat=%.2fV/%.1f°C/%d%%",
@@ -156,8 +129,13 @@ def main():
     next_poll = time.monotonic()
     next_log = time.monotonic()
 
+    # 毎時ロールアップ・日次バッチの重複実行防止
+    _last_hour_ts = (int(time.time()) // 3600) * 3600
+    _last_daily_ts = 0
+
     while not _shutdown.is_set():
         now = time.monotonic()
+        now_wall = time.time()
 
         if now >= next_poll:
             next_poll = now + config.TRACER_POLL_SEC
@@ -176,12 +154,34 @@ def main():
             status = webui.get_status()
             if status:
                 try:
-                    write_csv(status)
-                    logger.info("CSV logged: PV=%.1fW Bat=%.2fV/%.1f°C/%d%%",
+                    history_store.record(status)
+                    logger.info("Logged: PV=%.1fW Bat=%.2fV/%.1f°C/%d%%",
                                 status.get("pv_power", 0), status.get("bat_voltage", 0),
                                 status.get("bat_temp", 0), status.get("bat_soc", 0))
                 except Exception as e:
-                    logger.error("CSV write error: %s", e)
+                    logger.error("history_store.record error: %s", e)
+
+        # 毎時ロールアップ（時刻が次の時間帯に入ったら前の時間を集計）
+        cur_hour_ts = (int(now_wall) // 3600) * 3600
+        if cur_hour_ts > _last_hour_ts:
+            try:
+                history_store.rollup_hour(cur_hour_ts - 3600)
+            except Exception as e:
+                logger.error("rollup_hour error: %s", e)
+            _last_hour_ts = cur_hour_ts
+
+        # 日次バッチ（毎日 00:05 に前日分を HDD へ書き出し・prune）
+        now_dt = datetime.now()
+        today_0005 = int(
+            datetime(now_dt.year, now_dt.month, now_dt.day, 0, 5).timestamp()
+        )
+        if now_wall >= today_0005 and _last_daily_ts < today_0005:
+            try:
+                history_store.rollup_day()
+                history_store.daily_export_and_prune()
+            except Exception as e:
+                logger.error("daily_batch error: %s", e)
+            _last_daily_ts = today_0005
 
         _shutdown.wait(timeout=1.0)
 

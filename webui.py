@@ -1,4 +1,4 @@
-﻿"""Flask WebUI - CarIoT ダッシュボード
+"""Flask WebUI - CarIoT ダッシュボード
 
 エンドポイント:
   GET /              ダッシュボードHTML（認証不要）
@@ -15,6 +15,7 @@ from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
 
 import config
+import history_store
 import settings_store
 import wifi_manager
 
@@ -81,6 +82,13 @@ nav a{color:var(--bl);text-decoration:none;font-size:.85rem;margin-left:12px}
 .alert-y{background:#1f1a0d;border:1px solid var(--y);color:var(--y)}
 footer{color:var(--dm);font-size:.72rem;text-align:center;
        padding-top:8px;border-top:1px solid var(--bd);margin-top:8px}
+.stab{background:var(--bg);border:1px solid var(--bd);color:var(--dm);
+      border-radius:4px;padding:3px 10px;font-size:.78rem;cursor:pointer}
+.stab.on{background:#1f3555;color:var(--bl);border-color:var(--bl)}
+.gnav{background:var(--bg);border:1px solid var(--bd);color:var(--dm);
+      border-radius:4px;padding:4px 10px;font-size:.78rem;cursor:pointer}
+.gnav:hover{border-color:var(--bl);color:var(--bl)}
+.gnav:disabled{opacity:.35;cursor:default}
 </style>
 </head>
 <body>
@@ -211,6 +219,154 @@ async function refresh(){
   }catch(e){$('ts').textContent='通信エラー '+new Date().toLocaleTimeString('ja-JP');}
 }
 refresh();setInterval(refresh,5000);
+</script>
+
+<div class="card" style="margin-top:10px" id="graph-card">
+  <div class="ct">&#9889; 電力履歴</div>
+  <div style="display:flex;gap:4px;margin-bottom:10px" id="stabs">
+    <button class="stab on" data-s="minute">分</button>
+    <button class="stab" data-s="hour">時</button>
+    <button class="stab" data-s="day">日</button>
+    <button class="stab" data-s="week">週</button>
+    <button class="stab" data-s="month">月</button>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;font-size:.7rem;color:var(--dm);margin-bottom:8px">
+    <span><span style="display:inline-block;width:8px;height:8px;background:#3fb950;margin-right:3px;border-radius:1px"></span>PV</span>
+    <span><span style="display:inline-block;width:8px;height:8px;background:#58a6ff;margin-right:3px;border-radius:1px"></span>充電</span>
+    <span><span style="display:inline-block;width:8px;height:8px;background:#d29922;margin-right:3px;border-radius:1px"></span>Tracer負荷</span>
+    <span><span style="display:inline-block;width:8px;height:8px;background:#f0883e;margin-right:3px;border-radius:1px"></span>BMS負荷</span>
+    <span><span style="display:inline-block;width:14px;height:2px;background:#7F77DD;margin-right:3px;vertical-align:middle"></span>電圧(右V)</span>
+    <span><span style="display:inline-block;width:14px;border-top:2px dashed #f85149;margin-right:3px;vertical-align:middle"></span>温度(右℃)</span>
+  </div>
+  <div style="position:relative;width:100%;height:220px">
+    <canvas id="histChart" role="img" aria-label="PV・充電・消費の棒グラフとバッテリー電圧・温度のトレンド"></canvas>
+    <div id="gcmsg" style="position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;color:var(--dm);font-size:.85rem">読み込み中...</div>
+  </div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
+    <button class="gnav" id="g-older">&#8592; 過去へ</button>
+    <span id="g-range" style="font-size:.7rem;color:var(--dm);text-align:center;flex:1;padding:0 6px"></span>
+    <button class="gnav" id="g-newer">最新へ &#8594;</button>
+  </div>
+</div>
+
+<script src="/static/chart.umd.min.js"></script>
+<script>
+(function(){
+  var gScale='minute', gBefore=null, gChart=null, gPoints=[];
+  var LIMITS={minute:120,hour:72,day:60,week:52,month:24};
+  var UNITS={minute:'W',hour:'Wh',day:'Wh',week:'Wh',month:'Wh'};
+  var $=function(id){return document.getElementById(id);};
+
+  function fmtTs(ts,s){
+    var d=new Date(ts*1000),h=d.getHours(),m=d.getMinutes(),mo=d.getMonth()+1,dy=d.getDate();
+    if(s==='minute')return ('0'+h).slice(-2)+':'+('0'+m).slice(-2);
+    if(s==='hour')return mo+'/'+dy+' '+('0'+h).slice(-2)+'h';
+    if(s==='day')return mo+'/'+dy;
+    if(s==='week')return mo+'/'+dy+'~';
+    return d.getFullYear()+'/'+(d.getMonth()+1);
+  }
+  function fmtRange(pts){
+    if(!pts||!pts.length)return '';
+    var a=new Date(pts[0].t*1000),b=new Date(pts[pts.length-1].t*1000);
+    var fmt=function(d){return (d.getMonth()+1)+'/'+d.getDate()+' '+('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);};
+    return fmt(a)+' 〜 '+fmt(b);
+  }
+
+  function renderChart(data){
+    var msg=$('gcmsg');
+    if(!window.Chart){msg.textContent='Chart.jsが未設置 (setup_static.sh を実行してください)';return;}
+    if(!data||!data.points||!data.points.length){msg.textContent='データなし';msg.style.display='flex';return;}
+    msg.style.display='none';
+    gPoints=data.points;
+    var unit=UNITS[gScale];
+    var labels=data.points.map(function(p){return fmtTs(p.t,gScale);});
+    $('g-range').textContent=fmtRange(data.points);
+    $('g-older').disabled=!data.has_more;
+    $('g-newer').disabled=gBefore===null;
+
+    var ds=[
+      {type:'line',label:'電圧',data:data.points.map(function(p){return p.bat_v;}),yAxisID:'y1',
+       borderColor:'#7F77DD',borderWidth:2,pointRadius:0,tension:0.3,order:0},
+      {type:'line',label:'温度',data:data.points.map(function(p){return p.bat_temp;}),yAxisID:'y2',
+       borderColor:'#f85149',borderWidth:2,borderDash:[4,3],pointRadius:0,tension:0.3,order:0},
+      {type:'bar',label:'PV',data:data.points.map(function(p){return p.pv;}),stack:'gen',
+       backgroundColor:'#3fb950',order:1},
+      {type:'bar',label:'充電',data:data.points.map(function(p){return p.chg;}),stack:'use',
+       backgroundColor:'#58a6ff',order:1},
+      {type:'bar',label:'Tracer負荷',data:data.points.map(function(p){return p.load_tr;}),stack:'use',
+       backgroundColor:'#d29922',order:1},
+      {type:'bar',label:'BMS負荷',data:data.points.map(function(p){return p.load_bms;}),stack:'use',
+       backgroundColor:'#f0883e',order:1}
+    ];
+    if(gChart){gChart.destroy();gChart=null;}
+    var canvas=$('histChart');
+    gChart=new window.Chart(canvas,{
+      data:{labels:labels,datasets:ds},
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        interaction:{mode:'index',intersect:false},
+        plugins:{
+          legend:{display:false},
+          tooltip:{callbacks:{label:function(i){
+            var u=(i.dataset.label==='電圧')?'V':(i.dataset.label==='温度')?'℃':unit;
+            var v=i.parsed.y;
+            return i.dataset.label+': '+(v==null?'--':v.toLocaleString())+' '+u;
+          }}}
+        },
+        scales:{
+          x:{stacked:true,grid:{display:false},
+             ticks:{color:'#6e7681',font:{size:10},maxRotation:45,autoSkip:true,maxTicksLimit:12}},
+          y:{stacked:true,position:'left',grid:{color:'rgba(255,255,255,0.08)'},
+             ticks:{color:'#6e7681',font:{size:10}},
+             title:{display:true,text:unit,color:'#6e7681',font:{size:10}}},
+          y1:{position:'right',min:12.0,max:14.8,grid:{drawOnChartArea:false},
+              ticks:{color:'#7F77DD',font:{size:10},callback:function(v){return v.toFixed(1)+'V';}}},
+          y2:{position:'right',min:0,max:60,grid:{drawOnChartArea:false},
+              ticks:{color:'#f85149',font:{size:10},callback:function(v){return v+'℃';}}}
+        }
+      }
+    });
+    var tx0=0;
+    canvas.addEventListener('touchstart',function(e){tx0=e.touches[0].clientX;},{passive:true});
+    canvas.addEventListener('touchend',function(e){
+      var dx=e.changedTouches[0].clientX-tx0;
+      if(dx<-40)doOlder();
+      if(dx>40)doNewer();
+    },{passive:true});
+  }
+
+  async function loadGraph(before){
+    var msg=$('gcmsg');
+    msg.style.display='flex';msg.textContent='読み込み中...';
+    try{
+      var url='/api/history?scale='+gScale+(before!=null?'&before='+before:'');
+      var data=await fetch(url).then(function(r){return r.json();});
+      renderChart(data);
+    }catch(e){
+      msg.style.display='flex';msg.textContent='取得エラー: '+e.message;
+    }
+  }
+
+  function doOlder(){
+    if(gPoints.length>0)loadGraph(gPoints[0].t);
+  }
+  function doNewer(){
+    gBefore=null;loadGraph(null);
+  }
+
+  document.querySelectorAll('.stab').forEach(function(b){
+    b.addEventListener('click',function(){
+      gScale=b.dataset.s;gBefore=null;
+      document.querySelectorAll('.stab').forEach(function(x){x.classList.remove('on');});
+      b.classList.add('on');
+      loadGraph(null);
+    });
+  });
+  $('g-older').addEventListener('click',doOlder);
+  $('g-newer').addEventListener('click',doNewer);
+
+  loadGraph(null);
+})();
 </script>
 </body>
 </html>"""
@@ -785,6 +941,22 @@ def index():
 @app.route("/api/status")
 def api_status():
     return jsonify(get_status())
+
+
+@app.route("/api/history")
+def api_history():
+    scale = request.args.get("scale", "hour")
+    if scale not in ("minute", "hour", "day", "week", "month"):
+        return jsonify({"error": "invalid scale"}), 400
+    try:
+        before = int(request.args["before"]) if "before" in request.args else None
+        limit = int(request.args.get("limit", 0))
+    except ValueError:
+        return jsonify({"error": "invalid params"}), 400
+    try:
+        return jsonify(history_store.query(scale, before, limit))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/settings", methods=["GET"])
