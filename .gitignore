@@ -37,3 +37,8 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# DB (runtime data, not source)
+*.db
+*.db-shm
+*.db-wal
